@@ -1,0 +1,36 @@
+# Ignore Python bytecode files
+*.pyc
+*.pyo
+__pycache__/
+
+# Ignore virtual environment directories
+venv/
+.env/
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore logs and temporary files
+*.log
+*.tmp
+
+# Ignore IDE/editor specific files
+.vscode/
+.idea/
+*.swp
+
+# Ignore build artifacts
+build/
+dist/
+*.egg-info/
+
+# Ignore media files
+# *.jpg
+# *.png
+# *.mp4
+# *.mp3
+
+# Ignore sensitive files
+.env.local
+config.yaml
