@@ -33,53 +33,55 @@ class ErrorCorrection:
         print(f"Can correct up to {self.ecc_bytes//2} byte errors per chunk")
     
     def encode_message(self, binary_tensor):
-        """
-        Encode binary message tensor with Reed-Solomon error correction
-        
-        Args:
-            binary_tensor: torch.Tensor containing binary message (1D or 2D with batch dim)
+            """
+            Encode binary message tensor with Reed-Solomon error correction
             
-        Returns:
-            torch.Tensor: Encoded message with error correction
-        """
-        if binary_tensor.dim() == 2:
-            # Handle batch dimension
-            return torch.stack([self.encode_message(msg) for msg in binary_tensor])
-        
-        # Convert binary tensor to bytes
-        binary_np = binary_tensor.cpu().numpy().astype(np.uint8)
-        bits_len = len(binary_np)
-        
-        # Convert binary array to bytes
-        # First ensure length is multiple of 8
-        padding_bits = (8 - (bits_len % 8)) % 8
-        if padding_bits > 0:
-            binary_np = np.pad(binary_np, (0, padding_bits))
-        
-        # Reshape and pack bits into bytes
-        bytes_data = np.packbits(binary_np)
-        
-        # Store original bit length for later reconstruction
-        bits_length_bytes = bits_len.to_bytes(4, byteorder='big')
-        
-        # Prepend the bit length to the message
-        message_bytes = bits_length_bytes + bytes_data.tobytes()
-        
-        # Chunk the message and encode each chunk
-        encoded_chunks = []
-        for i in range(0, len(message_bytes), self.data_bytes_per_chunk):
-            chunk = message_bytes[i:i+self.data_bytes_per_chunk]
-            encoded_chunk = self.rs_codec.encode(chunk)
-            encoded_chunks.append(encoded_chunk)
-        
-        # Combine chunks and convert back to binary
-        encoded_bytes = b''.join(encoded_chunks)
-        encoded_bits = np.unpackbits(np.frombuffer(encoded_bytes, dtype=np.uint8))
-        
-        # Convert back to tensor
-        encoded_tensor = torch.from_numpy(encoded_bits).float()
-        
-        return encoded_tensor
+            Args:
+                binary_tensor: torch.Tensor containing binary message (1D or 2D with batch dim)
+                
+            Returns:
+                torch.Tensor: Encoded message with error correction
+            """
+            device = binary_tensor.device  # Store original device
+            
+            if binary_tensor.dim() == 2:
+                # Handle batch dimension
+                return torch.stack([self.encode_message(msg) for msg in binary_tensor])
+            
+            # Convert binary tensor to bytes (moving to CPU for numpy operations)
+            binary_np = binary_tensor.cpu().numpy().astype(np.uint8)
+            bits_len = len(binary_np)
+            
+            # Convert binary array to bytes
+            # First ensure length is multiple of 8
+            padding_bits = (8 - (bits_len % 8)) % 8
+            if padding_bits > 0:
+                binary_np = np.pad(binary_np, (0, padding_bits))
+            
+            # Reshape and pack bits into bytes
+            bytes_data = np.packbits(binary_np)
+            
+            # Store original bit length for later reconstruction
+            bits_length_bytes = bits_len.to_bytes(4, byteorder='big')
+            
+            # Prepend the bit length to the message
+            message_bytes = bits_length_bytes + bytes_data.tobytes()
+            
+            # Chunk the message and encode each chunk
+            encoded_chunks = []
+            for i in range(0, len(message_bytes), self.data_bytes_per_chunk):
+                chunk = message_bytes[i:i+self.data_bytes_per_chunk]
+                encoded_chunk = self.rs_codec.encode(chunk)
+                encoded_chunks.append(encoded_chunk)
+            
+            # Combine chunks and convert back to binary
+            encoded_bytes = b''.join(encoded_chunks)
+            encoded_bits = np.unpackbits(np.frombuffer(encoded_bytes, dtype=np.uint8))
+            
+            # Convert back to tensor and move to the original device
+            encoded_tensor = torch.from_numpy(encoded_bits).float().to(device)
+            
+            return encoded_tensor
     
     def decode_message(self, binary_tensor, confidence_scores=None):
         """
@@ -92,6 +94,8 @@ class ErrorCorrection:
         Returns:
             torch.Tensor: Decoded and error-corrected binary message
         """
+        device = binary_tensor.device  # Store original device
+        
         if binary_tensor.dim() == 2:
             # Handle batch dimension
             return torch.stack([self.decode_message(binary_tensor[i], 
@@ -139,13 +143,14 @@ class ErrorCorrection:
             # Trim to original length
             decoded_bits = decoded_bits[:original_bit_length]
             
-            # Convert back to tensor
-            decoded_tensor = torch.from_numpy(decoded_bits).float()
+            # Convert back to tensor and move to original device
+            decoded_tensor = torch.from_numpy(decoded_bits).float().to(device)
             
             # Ensure we return the correct message length (matching input expectation)
             if len(decoded_tensor) < binary_tensor.size(0):
                 decoded_tensor = torch.cat([decoded_tensor, 
-                                          torch.zeros(binary_tensor.size(0) - len(decoded_tensor))])
+                                          torch.zeros(binary_tensor.size(0) - len(decoded_tensor), 
+                                                     device=device)])
             elif len(decoded_tensor) > binary_tensor.size(0):
                 decoded_tensor = decoded_tensor[:binary_tensor.size(0)]
                 
