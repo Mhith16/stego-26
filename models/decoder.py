@@ -33,9 +33,10 @@ class DenseBlock(nn.Module):
         return x
 
 class SelfAttention(nn.Module):
-    """Self-attention module for focusing on important features during decoding"""
-    def __init__(self, in_channels):
+    """Memory-efficient self-attention module for focusing on important features during decoding"""
+    def __init__(self, in_channels, downsample_factor=4):
         super(SelfAttention, self).__init__()
+        self.downsample_factor = downsample_factor
         self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
         self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
         self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
@@ -44,19 +45,53 @@ class SelfAttention(nn.Module):
     def forward(self, x):
         batch_size, channels, height, width = x.size()
         
-        # Create query projection and reshape
-        proj_query = self.query(x).view(batch_size, -1, height * width).permute(0, 2, 1)
-        
-        # Create key projection and reshape
-        proj_key = self.key(x).view(batch_size, -1, height * width)
-        
-        # Calculate attention map
-        energy = torch.bmm(proj_query, proj_key)
-        attention = F.softmax(energy, dim=-1)
-        
-        # Create value projection and apply attention
-        proj_value = self.value(x).view(batch_size, -1, height * width)
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        # Downsample feature map for efficient attention computation
+        if self.downsample_factor > 1:
+            h, w = height // self.downsample_factor, width // self.downsample_factor
+            x_down = F.adaptive_avg_pool2d(x, (h, w))
+            
+            # Create key and value projections on downsampled feature map
+            proj_key = self.key(x_down).view(batch_size, -1, h * w)
+            proj_value = self.value(x_down).view(batch_size, -1, h * w)
+            
+            # Create query projection on original resolution
+            proj_query = self.query(x).view(batch_size, -1, height * width).permute(0, 2, 1)
+            
+            # Use chunked matrix multiplication to save memory
+            # Process in chunks along spatial dimension to avoid OOM
+            chunk_size = min(1024, height * width)
+            num_chunks = (height * width + chunk_size - 1) // chunk_size
+            output_chunks = []
+            
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, height * width)
+                
+                # Get query chunk
+                query_chunk = proj_query[:, start_idx:end_idx, :]
+                
+                # Calculate attention map for chunk
+                energy = torch.bmm(query_chunk, proj_key)
+                attention = F.softmax(energy, dim=-1)
+                
+                # Apply attention to values
+                chunk_output = torch.bmm(attention, proj_value.permute(0, 2, 1))
+                output_chunks.append(chunk_output)
+            
+            # Concatenate chunks
+            out = torch.cat(output_chunks, dim=1)
+        else:
+            # Standard attention if no downsampling
+            proj_query = self.query(x).view(batch_size, -1, height * width).permute(0, 2, 1)
+            proj_key = self.key(x).view(batch_size, -1, height * width)
+            proj_value = self.value(x).view(batch_size, -1, height * width)
+            
+            # Calculate attention map
+            energy = torch.bmm(proj_query, proj_key)
+            attention = F.softmax(energy, dim=-1)
+            
+            # Apply attention to values
+            out = torch.bmm(attention, proj_value.permute(0, 2, 1))
         
         # Reshape back and add residual connection with learnable weight
         out = out.view(batch_size, channels, height, width)
@@ -191,8 +226,9 @@ class SteganographyDecoder(nn.Module):
             nn.AvgPool2d(kernel_size=2, stride=2)
         )
         
-        # Self-attention for focusing on embedded data regions
-        self.attention = SelfAttention(128)
+        # Memory-efficient self-attention for focusing on embedded data regions
+        # Use higher downsample factor for larger images
+        self.attention = SelfAttention(128, downsample_factor=8)
         
         # Second dense block
         self.dense_block2 = DenseBlock(128, growth_rate, num_dense_layers)
@@ -299,14 +335,9 @@ class MultiScaleDecoder(nn.Module):
         """
         super(MultiScaleDecoder, self).__init__()
         
-        # Create three decoder branches for different scales
-        self.full_scale_decoder = SteganographyDecoder(
-            image_channels=image_channels,
-            message_length=message_length,
-            growth_rate=32,
-            num_dense_layers=6,
-            with_dct=True
-        )
+        # Create decoder branches for different scales
+        # For memory efficiency with large images, use only mid and small scale decoders
+        # Use fewer dense layers for memory efficiency
         
         self.mid_scale_decoder = SteganographyDecoder(
             image_channels=image_channels,
@@ -323,6 +354,10 @@ class MultiScaleDecoder(nn.Module):
             num_dense_layers=3,
             with_dct=False  # Smaller scale might lose DCT precision
         )
+        
+        # For 512x512 or larger images, skip the full-scale decoder to save memory
+        self.use_full_scale = False
+        
         
         # Fusion layer to combine predictions from different scales
         self.fusion = nn.Sequential(
@@ -343,23 +378,33 @@ class MultiScaleDecoder(nn.Module):
             tuple: (message, confidence) tensors [B, L]
         """
         batch_size = stego_image.size(0)
-        
-        # Process at full scale
-        full_msg, full_conf = self.full_scale_decoder(stego_image)
-        
-        # Process at mid scale (75%)
         h, w = stego_image.size()[2:]
-        mid_size = (int(h * 0.75), int(w * 0.75))
+        
+        # Check image size and dynamically determine if we should use full-scale processing
+        # For large images (512x512 or bigger), skip full-scale to save memory
+        self.use_full_scale = h < 512 and w < 512
+        
+        # Process at mid scale (60-75%)
+        mid_scale_factor = 0.6 if h >= 512 else 0.75
+        mid_size = (int(h * mid_scale_factor), int(w * mid_scale_factor))
         mid_scale_img = F.interpolate(stego_image, size=mid_size, mode='bilinear', align_corners=False)
         mid_msg, mid_conf = self.mid_scale_decoder(mid_scale_img)
         
-        # Process at small scale (50%)
-        small_size = (int(h * 0.5), int(w * 0.5))
+        # Process at small scale (40-50%)
+        small_scale_factor = 0.4 if h >= 512 else 0.5
+        small_size = (int(h * small_scale_factor), int(w * small_scale_factor))
         small_scale_img = F.interpolate(stego_image, size=small_size, mode='bilinear', align_corners=False)
         small_msg, small_conf = self.small_scale_decoder(small_scale_img)
         
-        # Concatenate all predictions for fusion
-        combined = torch.cat([full_msg, mid_msg, small_msg], dim=1)
+        if self.use_full_scale:
+            # Process at full scale only for smaller images
+            full_msg, full_conf = self.full_scale_decoder(stego_image)
+            # Concatenate all predictions for fusion
+            combined = torch.cat([full_msg, mid_msg, small_msg], dim=1)
+        else:
+            # For larger images, only use mid and small scale predictions
+            # Duplicate mid_msg to maintain the expected input dimension for fusion
+            combined = torch.cat([mid_msg, mid_msg, small_msg], dim=1)
         
         # Fuse predictions
         fused = self.fusion(combined)
