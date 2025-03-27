@@ -87,7 +87,8 @@ def embed_patient_data(image_path, text, model_path, output_path=None, config=No
     # Check if text is a file path
     if os.path.exists(text) and os.path.isfile(text):
         with open(text, 'r', encoding='utf-8') as f:
-            text_content = f.read().strip()
+            text_content = f.read()
+            text_content = ''.join(text_content.split())
     else:
         text_content = text
     

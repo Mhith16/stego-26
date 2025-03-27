@@ -80,7 +80,8 @@ class XrayDataset(Dataset):
         label_path = os.path.join(self.label_dir, label_file)
         try:
             with open(label_path, 'r', encoding='utf-8') as f:
-                patient_data = f.read().strip()
+                patient_data = f.read()
+                patient_data = ''.join(patient_data.split())
         except Exception as e:
             print(f"Error loading text {label_path}: {e}")
             patient_data = ""
